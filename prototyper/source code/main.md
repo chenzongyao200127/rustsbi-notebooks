@@ -1,35 +1,26 @@
 ~~~rust
-// 启用裸函数特性
 #![feature(naked_functions)]
-// 不使用标准库
 #![no_std]
-// 不使用main函数
 #![no_main]
-// 允许使用静态可变引用
 #![allow(static_mut_refs)]
 
-// 导入log宏
 #[macro_use]
 extern crate log;
-// 导入本地宏
 #[macro_use]
 mod macros;
 
-// 各个模块声明
-mod board;       // 开发板相关
-mod dt;          // 设备树相关
-mod fail;        // 错误处理
-mod platform;    // 平台相关
-mod riscv_spec;  // RISC-V规范相关
-mod sbi;         // SBI实现
+mod board;
+mod dt;
+mod fail;
+mod platform;
+mod riscv_spec;
+mod sbi;
 
-// 导入必要的类型和函数
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{arch::asm, mem::MaybeUninit};
 
 use sbi::extensions;
 
-// 从各个模块导入需要的组件
 use crate::board::{SBI_IMPL, SIFIVECLINT, SIFIVETEST, UART};
 use crate::riscv_spec::{current_hartid, menvcfg};
 use crate::sbi::console::SbiConsole;
@@ -44,48 +35,49 @@ use crate::sbi::trap::{self, trap_vec};
 use crate::sbi::trap_stack;
 use crate::sbi::SBI;
 
-// Rust主函数入口
+pub const START_ADDRESS: usize = 0x80000000;
+pub const R_RISCV_RELATIVE: usize = 3;
+
 #[no_mangle]
 extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
-    // 定义一个原子布尔值用于标记SBI是否已经准备就绪
+    // Track whether SBI is initialized and ready.
     static SBI_READY: AtomicBool = AtomicBool::new(false);
 
-    // 获取启动核心信息
     let boot_hart_info = platform::get_boot_hart(opaque, nonstandard_a2);
-    
-    // 如果是启动核心，执行初始化流程
+    // boot hart task entry.
     if boot_hart_info.is_boot_hart {
         let fdt_addr = boot_hart_info.fdt_address;
 
-        // 1. 初始化设备树
-        // 解析设备树二进制数据
+        // 1. Init FDT
+        // parse the device tree.
+        // TODO: shoule remove `fail:device_tree_format`.
         let dtb = dt::parse_device_tree(fdt_addr).unwrap_or_else(fail::device_tree_format);
         let dtb = dtb.share();
-        
-        // 反序列化设备树
+
+        // TODO: should remove `fail:device_tree_deserialize`.
         let tree =
             serde_device_tree::from_raw_mut(&dtb).unwrap_or_else(fail::device_tree_deserialize);
 
-        // 2. 初始化设备
-        // 获取各种设备的基地址
+        // 2. Init device
+        // TODO: The device base address should be find in a better way.
         let console_base = tree.soc.serial.unwrap().iter().next().unwrap();
         let clint_device = tree.soc.clint.unwrap().iter().next().unwrap();
         let cpu_num = tree.cpus.cpu.len();
         let console_base_address = console_base.at();
         let ipi_base_address = clint_device.at();
 
-        // 如果找到测试设备，初始化复位设备
+        // Initialize reset device if present.
         if let Some(test) = tree.soc.test {
             let reset_device = test.iter().next().unwrap();
             let reset_base_address = reset_device.at();
             board::reset_dev_init(usize::from_str_radix(reset_base_address, 16).unwrap());
         }
 
-        // 初始化控制台和IPI设备
+        // Initialize console and IPI devices.
         board::console_dev_init(usize::from_str_radix(console_base_address, 16).unwrap());
         board::ipi_dev_init(usize::from_str_radix(ipi_base_address, 16).unwrap());
 
-        // 3. 初始化SBI实现
+        // 3. Init the SBI implementation
         unsafe {
             SBI_IMPL = MaybeUninit::new(SBI {
                 console: Some(SbiConsole::new(&UART)),
@@ -95,18 +87,15 @@ extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
                 rfence: Some(SbiRFence),
             });
         }
-        
-        // 准备陷阱栈
-        trap_stack::prepare_for_trap();
-        // 初始化扩展
-        extensions::init(&tree.cpus.cpu);
-        // 标记SBI已就绪
-        SBI_READY.swap(true, Ordering::AcqRel);
-        
-        // 4. 初始化日志系统
-        logger::Logger::init();
 
-        // 打印启动信息
+        // Setup trap handling.
+        trap_stack::prepare_for_trap();
+        extensions::init(&tree.cpus.cpu);
+        SBI_READY.swap(true, Ordering::AcqRel);
+
+        // 4. Init Logger
+        logger::Logger::init().unwrap();
+
         info!("RustSBI version {}", rustsbi::VERSION);
         rustsbi::LOGO.lines().for_each(|line| info!("{}", line));
         info!("Initializing RustSBI machine-mode environment.");
@@ -126,7 +115,7 @@ extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
                 .unwrap_or("<unspecified>")
         );
 
-        // 配置物理内存保护(PMP)
+        // TODO: PMP configuration needs to be obtained through the memory range in the device tree
         use riscv::register::*;
         unsafe {
             pmpcfg0::set_pmp(0, Range::OFF, Permission::NONE, false);
@@ -135,18 +124,17 @@ extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
             pmpaddr1::write(usize::MAX >> 2);
         }
 
-        // 获取启动信息并设置下一阶段
+        // Get boot information and prepare for kernel entry.
         let boot_info = platform::get_boot_info(nonstandard_a2);
         let (mpp, next_addr) = (boot_info.mpp, boot_info.next_address);
-        
-        // 设置下一阶段启动参数
+
+        // Start kernel.
         local_remote_hsm().start(NextStage {
             start_addr: next_addr,
             next_mode: mpp,
             opaque: fdt_addr,
         });
 
-        // 打印重定向信息
         info!(
             "Redirecting hart {} to 0x{:0>16x} in {:?} mode.",
             current_hartid(),
@@ -154,9 +142,9 @@ extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
             mpp
         );
     } else {
-        // 非启动核心的初始化流程
-        
-        // 配置PMP
+        // Non-boot hart initialization path.
+
+        // TODO: PMP configuration needs to be obtained through the memory range in the device tree.
         use riscv::register::*;
         unsafe {
             pmpcfg0::set_pmp(0, Range::OFF, Permission::NONE, false);
@@ -165,82 +153,81 @@ extern "C" fn rust_main(_hart_id: usize, opaque: usize, nonstandard_a2: usize) {
             pmpaddr1::write(usize::MAX >> 2);
         }
 
-        // 设置陷阱栈
+        // Setup trap handling.
         trap_stack::prepare_for_trap();
 
-        // 等待SBI就绪
+        // Wait for boot hart to complete SBI initialization.
         while !SBI_READY.load(Ordering::Relaxed) {
             core::hint::spin_loop()
         }
     }
 
-    // 清除所有IPI
+    // Clear all pending IPIs.
     ipi::clear_all();
-    
-    // 配置机器模式CSR寄存器
+
+    // Configure CSRs and trap handling.
     unsafe {
-        // 设置中断和异常委托
+        // Delegate all interrupts and exceptions to supervisor mode.
         asm!("csrw mideleg,    {}", in(reg) !0);
         asm!("csrw medeleg,    {}", in(reg) !0);
         asm!("csrw mcounteren, {}", in(reg) !0);
         use riscv::register::{medeleg, mtvec};
-        // 清除特定的异常委托
+        // Keep supervisor environment calls and illegal instructions in M-mode.
         medeleg::clear_supervisor_env_call();
         medeleg::clear_illegal_instruction();
-        
-        // 根据是否支持Sstc扩展来设置menvcfg
-        if hart_extension_probe(current_hartid(),Extension::Sstc) {
+        // Configure environment features based on available extensions.
+        if hart_extension_probe(current_hartid(), Extension::Sstc) {
             menvcfg::set_bits(
                 menvcfg::STCE | menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE,
             );
         } else {
             menvcfg::set_bits(menvcfg::CBIE_INVALIDATE | menvcfg::CBCFE | menvcfg::CBZE);
         }
-        
-        // 设置陷阱向量
+        // Set up vectored trap handling.
         mtvec::write(trap_vec as _, mtvec::TrapMode::Vectored);
     }
 }
 
-// 启动入口点
 #[naked]
 #[link_section = ".text.entry"]
 #[export_name = "_start"]
 unsafe extern "C" fn start() -> ! {
     core::arch::asm!(
-        // 1. 关闭中断
+        // 1. Turn off interrupt.
         "   csrw    mie, zero",
-        // 2. 初始化运行时环境
-        // 只有启动核心才清除bss段
+        // 2. Initialize programming langauge runtime.
+        // only clear bss if hartid matches preferred boot hart id.
         "   csrr    t0, mhartid",
         "   bne     t0, zero, 4f",
+        "   call    {relocation_update}",
         "1:",
-        // 3. 启动核心清除bss段
-        "   la      t0, sbss
-            la      t1, ebss
+        // 3. Hart 0 clear bss segment.
+        "   lla     t0, sbss
+            lla     t1, ebss
          2: bgeu    t0, t1, 3f
             sd      zero, 0(t0)
             addi    t0, t0, 8
             j       2b",
-        "3: ", // 启动核心设置bss就绪信号
-        "   la      t0, 6f
+        "3: ", // Hart 0 set bss ready signal.
+        "   lla     t0, 6f
             li      t1, 1
             amoadd.w t0, t1, 0(t0)
             j       5f",
-        "4:", // 其他核心等待bss就绪信号
+        "4:", // Other harts are waiting for bss ready signal.
         "   li      t1, 1
-            la      t0, 6f
+            lla     t0, 6f
             lw      t0, 0(t0)
             bne     t0, t1, 4b", 
         "5:",
-         // 4. 为每个核心准备栈
+         // 4. Prepare stack for each hart.
         "   call    {locate_stack}",
         "   call    {main}",
         "   csrw    mscratch, sp",
         "   j       {hart_boot}",
         "  .balign  4",
-        "6:",  // bss就绪信号
+        "6:",  // bss ready signal.
         "  .word    0",
+        relocation_update = sym relocation_update,
         locate_stack = sym trap_stack::locate,
         main         = sym rust_main,
         hart_boot    = sym trap::msoft,
@@ -248,17 +235,48 @@ unsafe extern "C" fn start() -> ! {
     )
 }
 
-// panic处理函数
+// Handle relocations for position-independent code
+#[naked]
+unsafe extern "C" fn relocation_update() {
+    asm!(
+        // Get load offset.
+        "   li t0, {START_ADDRESS}",
+        "   lla t1, .text.entry",
+        "   sub t2, t1, t0",
+
+        // Foreach rela.dyn and update relocation.
+        "   lla t0, __rel_dyn_start",
+        "   lla t1, __rel_dyn_end",
+        "   li  t3, {R_RISCV_RELATIVE}",
+        "1:",
+        "   ld  t4, 8(t0)",
+        "   bne t4, t3, 2f",
+        "   ld t4, 0(t0)", // Get offset
+        "   ld t5, 16(t0)", // Get append
+        "   add t4, t4, t2", // Add load offset to offset add append
+        "   add t5, t5, t2",
+        "   sd t5, 0(t4)", // Update address
+        "   addi t0, t0, 24", // Get next rela item
+        "2:",
+        "   blt t0, t1, 1b",
+
+        // Return
+        "   ret",
+        R_RISCV_RELATIVE = const R_RISCV_RELATIVE,
+        START_ADDRESS = const START_ADDRESS,
+        options(noreturn)
+    )
+}
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use riscv::register::*;
-    // 打印panic信息
     println!(
         "[rustsbi-panic] hart {} {info}",
         riscv::register::mhartid::read()
     );
-    // 打印关键寄存器信息
-    println!("-----------------------------
+    println!(
+        "-----------------------------
 > mcause:  {:?}
 > mepc:    {:#018x}
 > mtval:   {:#018x}
@@ -268,66 +286,179 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         mtval::read()
     );
     println!("[rustsbi-panic] system shutdown scheduled due to RustSBI panic");
-    // 死循环
     loop {}
 }
-
 ~~~
 
 
-这段Rust代码是一个低级系统软件的一部分，可能是固件或引导加载程序，专为RISC-V架构设计。它实现了RustSBI（Supervisor Binary Interface）环境，这是RISC-V系统中操作系统与固件之间接口的规范。以下是对代码的详细解释：
 
-### 特性和属性
+# 启动 Overview
 
-- `#![feature(naked_functions)]`：启用裸函数特性，允许函数没有前序或后序，从而可以精确控制函数的汇编。
-- `#![no_std]`：表示不使用标准库，这在低级系统编程中很常见。
-- `#![no_main]`：禁用标准的main函数入口，因为这段代码不是典型的Rust应用程序。
-- `#![allow(static_mut_refs)]`：允许使用可变的静态引用，这通常是不安全的，但在低级编程中是必要的。
+整个 `rust_main` 函数的流程可以分为以下几个主要阶段，每个阶段都有其特定的目的和操作：
 
-### 模块和宏导入
+#### 1. 硬件信息获取与设备树解析（Hardware Information Acquisition and Device Tree Parsing）
+- 目的：在系统启动时，获取硬件配置信息和启动参数。
+- 操作：
+  - 通过 `platform::get_boot_hart` 获取启动硬件信息，包括设备树（FDT）地址。
+  - 解析设备树，获取硬件资源信息，如控制台和IPI（处理器间中断）设备的基地址。
 
-- `extern crate log;` 和 `mod macros;`：导入日志宏和自定义宏以供代码使用。
-- 模块：代码组织成几个模块（`board`、`dt`、`fail`、`platform`、`riscv_spec`、`sbi`），分别处理系统的不同方面，如开发板相关操作、设备树解析、错误处理、平台相关操作、RISC-V规范和SBI实现。
+#### 2. 硬件设备初始化（Hardware Device Initialization）
+- 目的：初始化控制台、IPI和其他必要的硬件设备，以便它们可以在操作系统中使用。
+- 操作：
+  - 根据设备树中的信息，初始化控制台和IPI设备。
+  - 如果存在，初始化重置设备。
 
-### 主函数 (`rust_main`)
+#### 3. SBI（Supervisor Binary Interface）实现初始化（SBI Implementation Initialization）
+- 目的：设置SBI实现，这是RISC-V架构中用于操作系统和硬件之间交互的接口。
+- 操作：
+  - 初始化SBI实现，包括控制台、IPI、HSM（硬件状态管理）、重置和远程栅栏（RFence）等组件。
+  - 设置陷阱处理，为操作系统的异常和中断处理做准备。
 
-- 原子布尔值 `SBI_READY`：用于指示SBI环境是否已准备就绪。
-- 启动核心初始化：如果当前hart（硬件线程）是启动hart，则执行初始化任务：
-  - 设备树初始化：解析和反序列化设备树以配置硬件设备。
-  - 设备初始化：使用设备树中的地址初始化控制台、IPI（处理器间中断）和复位设备。
-  - SBI实现初始化：设置SBI实现，包括控制台、IPI、HSM（Hart状态管理）、复位和RFence（远程栅栏）功能。
-  - 陷阱栈准备：为处理陷阱（异常和中断）准备栈。
-  - 扩展初始化：根据CPU信息初始化SBI扩展。
-  - 日志记录：初始化日志系统并打印启动信息。
-  - 物理内存保护（PMP）配置：配置PMP以控制内存区域的访问。
-  - 下一阶段设置：配置引导的下一阶段，设置下一个执行阶段的地址和模式。
-- 非启动核心初始化：对于非启动核心，等待SBI准备就绪并准备陷阱栈。
-- 清除IPI：清除所有待处理的IPI。
-- CSR配置：配置机器模式CSR（控制和状态寄存器）以进行中断和异常委托，并设置陷阱向量。
+#### 4. 日志系统初始化（Logger Initialization）
+- 目的：设置日志系统，以便在系统启动和运行时记录重要的信息和事件。
+- 操作：
+  - 初始化日志系统，打印RustSBI版本信息和启动日志。
 
-### 启动函数 (`start`)
+#### 5. 处理器模式配置（Processor Mode Configuration）
+- 目的：配置处理器模式，确保所有中断和异常都被正确地委托给 supervisor 模式。
+- 操作：
+  - 设置PMP（物理内存保护）配置，保护内存区域。
+  - 配置CSR（控制和状态寄存器）和陷阱处理，以适应操作系统的需求。
 
-- 裸函数：此函数标记为`naked`以允许精确控制汇编指令。
-- 汇编代码：包含RISC-V汇编指令以：
-  - 关闭中断。
-  - 初始化运行时环境。
-  - 为启动hart清除BSS段。
-  - 为每个hart准备栈。
-  - 调用`rust_main`函数。
-  - 设置栈指针并跳转到hart引导函数。
+#### 6. 启动信息获取与内核启动（Boot Information Acquisition and Kernel Start）
+- 目的：获取启动信息，并启动操作系统内核。
+- 操作：
+  - 获取启动信息，包括下一个执行地址和特权模式。
+  - 启动操作系统内核，将控制权从SBI转移到操作系统。
 
-### Panic处理程序
+#### 7. 非启动核心的初始化（Non-Boot Core Initialization）
+- 目的：对于非启动核心，等待启动核心完成SBI初始化，并设置必要的处理器配置。
+- 操作：
+  - 等待启动核心完成SBI初始化。
+  - 配置PMP和陷阱处理，以确保非启动核心可以安全地运行。
 
-- Panic处理：定义了一个自定义的panic处理程序，打印panic信息，包括hart ID和关键寄存器值（`mcause`、`mepc`、`mtval`），并进入无限循环以停止系统。
+#### 为什么要这么做：
+这些阶段确保了系统从硬件到软件的平滑过渡，每一步都是构建一个稳定、安全和可预测的操作系统环境所必需的。
+通过初始化硬件设备、设置SBI接口、配置处理器模式和启动操作系统内核，`rust_main` 函数为操作系统的启动和运行提供了必要的基础。
+此外，对于多核系统，它还确保了所有核心都能够正确地初始化和同步，这对于系统的稳定性和性能至关重要。
 
-这段代码是RISC-V系统引导过程中的关键部分，设置操作系统运行的环境，并通过SBI提供基本服务。
 
-引导加载程序的主要职责是初始化硬件环境，并为操作系统的启动做好准备。以下是一些支持这一判断的理由：
 
-1. **低级硬件初始化**: 代码中涉及设备树解析、设备初始化（如控制台和IPI设备）、物理内存保护（PMP）配置等，这些都是引导加载程序常见的任务。
-2. **多核支持**: 代码中有对启动核心和非启动核心的不同处理，这表明它在为多核系统做准备，这也是引导加载程序的职责之一。
-3. **SBI实现**: 代码实现了SBI（Supervisor Binary Interface），这是RISC-V架构中固件与操作系统之间的接口。引导加载程序通常负责提供这样的接口，以便操作系统能够与底层硬件交互。
-4. **无标准库和主函数**: 使用了 `#![no_std]` 和 `#![no_main]`，这表明代码不依赖于Rust的标准库和常规的程序入口点，这在引导加载程序中很常见，因为它们需要直接与硬件交互。
-5. **汇编代码和裸函数**: 使用了裸函数和汇编代码来精确控制硬件行为，这也是引导加载程序的典型特征，因为它们需要在非常低的级别上操作硬件。
+## 硬件信息获取与设备树解析（Hardware Information Acquisition and Device Tree Parsing）
 
-综上所述，这段代码确实符合引导加载程序的特征，负责在系统启动时进行必要的初始化和配置，以便操作系统能够顺利加载和运行。
+### 硬件信息获取
+
+在计算机系统中，启动过程通常涉及到从一个或多个非易失性存储设备（如硬盘、SSD、EPROM等）加载操作系统。在系统启动的早期阶段，需要获取硬件配置信息，以便操作系统能够识别和配置硬件资源。这些信息包括CPU核心数、内存布局、外设（如串口、网络接口、图形适配器等）的地址和配置。
+
+在RISC-V架构中，启动过程可能涉及到一个或多个硬件线程（hart），每个hart都需要知道自己是否是启动hart（boot hart）。
+启动hart负责初始化系统，包括解析设备树、初始化硬件设备和启动操作系统内核。非启动hart则等待启动hart完成这些初始化步骤。
+
+### 设备树（Device Tree）
+
+设备树是一种用于描述硬件配置的数据结构，它在系统启动时提供给操作系统。设备树以树状结构组织，每个节点代表一个硬件设备或硬件资源。
+设备树的源文件通常以`.dts`（Device Tree Source）格式编写，然后使用设备树编译器（如DTC）编译成二进制格式`.dtb`（Device Tree Blob）。
+
+设备树包含的信息非常丰富，包括：
+
+- **CPU核心**：包括核心数、每个核心的启动地址等。
+- **内存**：包括内存的大小、类型（如DDR3、DDR4等）、地址范围等。
+- **外设**：包括外设的类型、基地址、中断号等。
+- **总线**：包括总线的类型（如I2C、SPI、UART等）和连接的设备。
+
+### 设备树解析
+
+在操作系统启动过程中，设备树被解析以获取硬件配置信息。这通常涉及到以下步骤：
+
+1. **设备树地址获取**：启动hart通过启动参数获取设备树的地址。
+2. **设备树解析**：使用设备树解析库（如libfdt）解析设备树，将其转换为操作系统可以操作的数据结构。
+3. **硬件资源获取**：从解析后的设备树中提取硬件资源信息，如控制台的基地址、IPI设备的基地址等。
+
+设备树解析是操作系统启动过程中的关键步骤，因为它为操作系统提供了必要的硬件配置信息，使得操作系统能够正确地识别和配置硬件资源。
+
+### 为什么要这么做
+
+使用设备树的好处包括：
+
+- **灵活性**：设备树允许操作系统在不修改代码的情况下支持不同的硬件配置。
+- **可维护性**：设备树将硬件配置信息集中管理，便于维护和更新。
+- **可扩展性**：设备树支持新的硬件类型和配置，便于扩展和适应新的硬件。
+
+通过设备树，操作系统能够以一种标准化和结构化的方式获取硬件配置信息，这对于操作系统的启动和运行至关重要。
+
+
+
+
+
+## 硬件设备初始化（Hardware Device Initialization）
+
+### 硬件设备初始化的背景知识
+
+在操作系统启动过程中，硬件设备初始化是一个关键步骤。
+操作系统需要与硬件设备进行交互，以提供用户所需的功能，例如显示输出、键盘输入、网络通信等。
+因此，在操作系统内核启动之前，必须确保所有必要的硬件设备已经正确初始化。
+
+### 硬件设备初始化的目的
+
+1. 确保设备可用性：初始化过程确保硬件设备处于可用状态，准备好接收操作系统的指令。
+2. 配置设备参数：根据设备树中提供的信息，设置设备的参数，如内存地址、中断号等。
+3. 建立通信通道：初始化过程中，操作系统会建立与硬件设备的通信通道，例如配置串口通信参数。
+
+### 硬件设备初始化的过程
+
+1. 控制台设备初始化：
+   - 控制台设备通常是系统启动过程中的第一个输出设备，用于显示启动信息和调试消息。
+   - 在`rust_main`函数中，通过从设备树中获取控制台设备的基地址，然后调用`board::console_dev_init`函数来初始化控制台设备。
+
+2. IPI（处理器间中断）设备初始化：
+   - 在多核系统中，IPI是核心之间通信的重要机制，用于同步核心或发送中断信号。
+   - 通过从设备树中获取IPI设备的基地址，然后调用`board::ipi_dev_init`函数来初始化IPI设备。
+
+3. 重置设备初始化（如果存在）：
+   - 重置设备用于在系统启动或运行中进行硬件重置。
+   - 如果设备树中指定了重置设备，通过获取其基地址并调用`board::reset_dev_init`函数来初始化。
+
+### 为什么要初始化硬件设备
+
+- 系统稳定性：正确初始化硬件设备可以避免系统运行中出现硬件故障或崩溃。
+- 性能优化：初始化过程中可以优化硬件设备的配置，提高系统性能。
+- 功能实现：未初始化的硬件设备无法使用，初始化是实现设备功能的基础。
+
+### 硬件设备初始化与操作系统的关系
+
+- 内核与硬件的桥梁：硬件设备初始化为操作系统内核提供了与硬件交互的必要接口。
+- 驱动程序的基础：硬件设备初始化通常涉及到加载和初始化设备驱动程序，这是操作系统管理硬件资源的基础。
+
+通过硬件设备初始化，操作系统能够确保在启动过程中以及之后的运行中，所有硬件设备都能够按照预期工作，为用户和应用程序提供必要的硬件支持。
+
+
+
+
+
+
+
+## SBI（Supervisor Binary Interface）实现初始化（SBI Implementation Initialization）
+
+### SBI（Supervisor Binary Interface）的背景知识
+
+SBI（Supervisor Binary Interface）是RISC-V架构中定义的一套二进制接口标准，用于在操作系统的监督模式（Supervisor Mode）和硬件之间进行交互。
+SBI提供了一组标准化的函数和调用约定，使得操作系统能够以统一的方式执行诸如系统调用、中断处理、电源管理等操作。
+
+### SBI实现初始化的目的
+
+1. 标准化硬件交互：SBI定义了一组标准的接口，使得操作系统能够以一致的方式与硬件进行交互，无论硬件的具体实现如何。
+2. 简化操作系统开发：通过提供统一的接口，SBI简化了操作系统的开发工作，因为开发者不需要针对每种硬件都编写特定的代码。
+3. 提高系统稳定性：SBI通过标准化的接口来管理硬件，有助于减少硬件相关错误和系统崩溃。
+
+### SBI实现初始化的过程
+
+1. 初始化SBI结构体：
+   - 在`rust_main`函数中，使用`unsafe`代码块来初始化`SBI_IMPL`全局变量，这是一个`MaybeUninit<SBI>`类型的变量，用于存储SBI实现的具体结构。
+   - 结构体`SBI`包含了指向控制台、IPI、HSM（硬件状态管理）、重置和远程栅栏（RFence）等组件的指针。
+
+2. 设置陷阱处理：
+   - `trap_stack::prepare_for_trap`函数用于准备陷阱（异常和中断）处理所需的堆栈和上下文。
+   - 这确保了当系统发生异常或中断时，操作系统能够捕获并处理这些事件。
+
+3. 标记SBI为就绪：
+   - 使用`SBI_READY.swap(true, Ordering::AcqRel)`来标记SBI实现已经初始化并准备好使用。
+   - 这个原子操作确保了在多核系统中，所有核心都能看到SBI实现的最新状态。
